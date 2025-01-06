@@ -1,0 +1,209 @@
+#!/bin/sh
+#
+/bin/busybox --install -s || emergency_shell "Failed to install busybox symlinks"
+
+# Setup basic environment for emergency shell
+setup_emergency_env() {
+    # Ensure essential filesystems are mounted
+    mount -t proc proc /proc 2>/dev/null || true
+    mount -t sysfs sysfs /sys 2>/dev/null || true
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+    # Set up basic path
+    export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+    
+    # Create a basic PS1 prompt
+    export PS1='(emergency) # '
+}
+
+# Enhanced error handler with debug info
+emergency_shell() {
+    echo "ERROR: $1"
+    echo "Dropping to emergency shell..."
+    echo ""
+    echo "Available block devices:"
+    blkid
+    echo ""
+    echo "Loaded modules:"
+    lsmod
+    echo ""
+    echo "Mount points:"
+    mount
+    echo ""
+    echo "Type 'exit' to continue boot process"
+    echo "-----------------------------------"
+    
+    setup_emergency_env
+    exec /bin/busybox sh
+}
+
+# Output debug message with timestamp
+debug() {
+    echo "[$(busybox date +%T)] $@"
+}
+
+debug "Starting init process..."
+
+# Make BusyBox symlinks available
+/bin/busybox --install -s || emergency_shell "Failed to install busybox symlinks"
+
+# Create necessary directories
+mkdir -p /dev/mapper /etc /lib /mnt/root /proc /run/cryptsetup /sys /tmp /var/run /var/log
+touch /var/log/lastlog
+
+# Mount essential filesystems
+mount -t proc none /proc || emergency_shell "Failed to mount proc"
+mount -t sysfs none /sys || emergency_shell "Failed to mount sysfs"
+mount -t devtmpfs none /dev 2>/dev/null || true
+
+# Load device driver modules early
+debug "Loading kernel modules"
+
+# Load base subsystems first
+MODULE_DIR=$(ls -d /lib/modules/* | head -n1)
+if [ -z "$MODULE_DIR" ] || [ ! -f "$MODULE_DIR/modules.builtin" ]; then
+    echo "Error: Could not find valid kernel modules directory" >&2
+    exit 1
+fi
+
+for mod in crct10dif_common crct10dif_generic crc-t10dif crc64_rocksoft t10-pi sd_mod dm-mod dm-crypt fat vfat xfs nls_utf8; do
+    debug "Loading $mod"
+    modprobe $mod 2>/dev/null || debug "Warning: Failed to load $mod"
+done
+
+if ! grep -q 'ahci' /proc/modules && ! grep -q 'libata' /proc/modules; then
+    echo "AHCI or libata support is built into the kernel."
+fi
+
+# Setup mdev for device management
+debug "Configuring mdev"
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+mdev -s
+
+# Trigger device scan after modules are loaded
+debug "Secondary mdev scan after all modules"
+mdev -s
+
+# Debug output for initial state
+debug "Initial block devices:"
+ls -l /dev/sd* /dev/nvme* 2>/dev/null || debug "No block devices found yet"
+debug "Block device info:"
+blkid 2>/dev/null || debug "No block devices detected by blkid"
+debug "Loaded kernel modules:"
+lsmod
+
+# Read configuration
+if [ -f /etc/init.conf ]; then
+    debug "Loading init.conf"
+    . /etc/init.conf
+fi
+
+[ -n "$HOSTNAME" ] && hostname "$HOSTNAME"
+
+# Handle encrypted root
+if [ -n "$MAPPER_NAME" ]; then
+    debug "Encrypted root setup: $ROOT_DEVICE -> /dev/mapper/$MAPPER_NAME"
+    
+    # Wait for the device to appear (up to 10 seconds)
+    debug "Waiting for root device to appear"
+    for i in $(seq 1 10); do
+        if [ -b "$ROOT_DEVICE" ]; then
+            break
+        fi
+        debug "Root device not found, waiting... ($i/10)"
+        sleep 1
+        mdev -s
+    done
+    
+    [ -b "$ROOT_DEVICE" ] || emergency_shell "Root device $ROOT_DEVICE not found!"
+    sleep 3
+    cat << 'EOF'
+                  _        .                          .            (
+                 (_)        .       .                                     .
+  .        ____.--^.
+   .      /:  /    |                               +           .         .
+         /:  `--=--'   .                                                .
+        /: __[\==`-.___          *           .
+       /__|\ _~~~~~~   ~~--..__            .             .
+       \   \|::::|-----.....___|~--.                                 .
+        \ _\_~~~~~-----:|:::______//---...___
+    .   [\  \  __  --     \       ~  \_      ~~~===------==-...____
+        [============================================================-
+        /         __/__   --  /__    --       /____....----''''~~~~      .
+  *    /  /   ==           ____....=---='''~~~~ .
+      /____....--=-''':~~~~                      .                .
+      .       ~--~         Kuat Drive Yard's Imperial-class Star Destroyer
+                     .                                   .           .
+ . . .....=*#%%%@%%%#*=. .. .    
+      :*@#=:.+#%@%#+.:-#@*: .  ..
+    .#%=. .=%@@@@@@@%=. .-%%..   
+  .+@=.:+@@@@@@#+*@@@@@@+:.=@+.. 
+ .*@-#@@@@@@@@@+ =@@@@@@@@@#-@#: 
+.*#+@@@@%@@@@@@# *@@@@@@%@@@@+#*.
+-%-#@@@+..=@@@=...=@@@=..=@@@#-%-
+#*.:@@@@@*:...     ...:+@@@@@:.*#
+@+ =@@@@@@@*.. ..   .+@@@@@@@+ =@
+@+ =@@@@@@@*..   . ..+@@@@@@@+ =@
+#*.:@@@@@+:...     ...:+@@@@@:.*#
+-%-#@@@+. =@@@=. .=@@@=..=@@@#-%-
+.*#+@@@@%@@@@@@# *@@@@@@%@@@@+**.
+ .*@-#@@@@@@@@@+ =@@@@@@@@@#-@#:.
+  .+@=::+@@@@@@#+#@@@@@@+::=@*.  
+.  ..#%-...+%@@@@@@@%+...-%%..   
+      :*@#-..+#%@%#+..-#@*:    . 
+  .   .  .=*#%%%@%%%%*=.        .
+
+Welcome! This is tux, a Gentoo Linux system.
+Attempting to unlock the encrypted root partition...
+EOF
+    mkdir -p /run/cryptsetup
+    cryptsetup luksOpen --header /dev/sda4 "$ROOT_DEVICE" "$MAPPER_NAME" || emergency_shell "cryptsetup failed"
+    dmesg -E
+    # Wait for mapper device (up to 5 seconds)
+    debug "Waiting for mapper device"
+    for i in $(seq 1 5); do
+        if [ -b "/dev/mapper/$MAPPER_NAME" ]; then
+            break
+        fi
+        debug "Mapper device not found, waiting... ($i/5)"
+        sleep 1
+        mdev -s
+    done
+    
+    [ -b "/dev/mapper/$MAPPER_NAME" ] || emergency_shell "Mapped device /dev/mapper/$MAPPER_NAME not found"
+    ROOT_DEVICE="/dev/mapper/$MAPPER_NAME"
+fi
+
+# Handle MD RAID if needed
+if [ -x /sbin/mdadm ]; then
+    debug "Assembling MD RAID arrays"
+    mdadm -As || debug "mdadm assembly warning (non-fatal)"
+    mdev -s
+fi
+
+# Debug output before mounting
+debug "Pre-mount device status:"
+ls -l /dev/sd* /dev/mapper/* 2>/dev/null || true
+debug "Block device details:"
+blkid
+
+# Handle root mount
+mount_opts=
+if [ -f /etc/fstab ]; then
+    debug "Reading mount options from fstab"
+    mount_opts="$(grep -ve '^#' /etc/fstab | awk '$2 == "/" { print $4 }')"
+fi
+[ -n "$mount_opts" ] && mount_opts="-o $mount_opts"
+
+debug "Mounting root: $ROOT_DEVICE -> /mnt/root"
+mkdir -p /mnt/root
+mount $mount_opts "$ROOT_DEVICE" /mnt/root || emergency_shell "Failed to mount $ROOT_DEVICE"
+
+# Clean up
+debug "Cleaning up before switch_root"
+umount /proc
+umount /sys
+umount /dev 2>/dev/null || true
+
+debug "Switching root to /sbin/init"
+exec switch_root /mnt/root /sbin/init || emergency_shell "Failed to switch_root"

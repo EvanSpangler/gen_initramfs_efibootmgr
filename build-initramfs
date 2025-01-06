@@ -1,0 +1,603 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")"
+
+verify_init() {
+    local temp_dir="$1"
+    echo ">>> Verifying init script..."
+    
+    if [ ! -f "$temp_dir/init" ]; then
+        echo "ERROR: /init is missing from initramfs!" >&2
+        return 1
+    fi
+    
+    if [ ! -x "$temp_dir/init" ]; then
+        echo "ERROR: /init is not executable!" >&2
+        return 1
+    fi
+    
+    # Check init script dependencies
+    echo "Checking init script dependencies:"
+    if readelf -l "$temp_dir/init" >/dev/null 2>&1; then
+        local missing_libs=$(ldd "$temp_dir/init" 2>/dev/null | grep "not found")
+        if [ -n "$missing_libs" ]; then
+            echo "ERROR: Missing libraries for init:" >&2
+            echo "$missing_libs" >&2
+            return 1
+        fi
+    else
+        echo "Note: init appears to be a script, skipping library check"
+    fi
+    
+    # Verify init script first line (shebang)
+    local shebang=$(head -n1 "$temp_dir/init")
+    if ! echo "$shebang" | grep -q "^#!.*busybox.*sh" && \
+       ! echo "$shebang" | grep -q "^#!/bin/sh"; then
+        echo "WARNING: Init script might have incorrect shebang: $shebang" >&2
+    fi
+    
+    echo "Init script verification passed"
+    return 0
+}
+
+verify_busybox() {
+    local temp_dir="$1"
+    echo ">>> Verifying busybox setup..."
+    
+    if [ ! -f "$temp_dir/bin/busybox" ]; then
+        echo "ERROR: busybox binary missing!" >&2
+        return 1
+    fi
+    
+    if [ ! -x "$temp_dir/bin/busybox" ]; then
+        echo "ERROR: busybox is not executable!" >&2
+        return 1
+    fi
+    
+    # Setup lib64 symlink if needed
+    if [ ! -e "$temp_dir/lib64" ]; then
+        ln -sf lib "$temp_dir/lib64"
+    fi
+    
+    # Ensure ld-linux is in the right place
+    if [ ! -e "$temp_dir/lib64/ld-linux-x86-64.so.2" ]; then
+        mkdir -p "$temp_dir/lib64"
+        cp -a /lib64/ld-linux-x86-64.so.2 "$temp_dir/lib64/"
+    fi
+    
+    # Check busybox dependencies
+    echo "Checking busybox dependencies:"
+    local missing_libs=$(ldd "$temp_dir/bin/busybox" 2>/dev/null | grep "not found")
+    if [ -n "$missing_libs" ]; then
+        echo "ERROR: Missing libraries for busybox:" >&2
+        echo "$missing_libs" >&2
+        return 1
+    fi
+    
+    # Verify essential busybox applets are available
+    echo "Verifying essential busybox applets..."
+    local required_applets="sh mount switch_root mdev blkid lsmod modprobe insmod"
+    local missing_applets=""
+    
+    # Create temporary symlinks to check applet functionality
+    (
+        cd "$temp_dir/bin"
+        for applet in $required_applets; do
+            if ! ./busybox --list | grep -q "^$applet$"; then
+                missing_applets="$missing_applets $applet"
+            fi
+        done
+    )
+    
+    if [ -n "$missing_applets" ]; then
+        echo "ERROR: Missing required busybox applets:$missing_applets" >&2
+        return 1
+    fi
+    
+    # Verify sh symlink
+    if [ ! -L "$temp_dir/bin/sh" ] || [ ! -e "$temp_dir/bin/sh" ]; then
+        echo "ERROR: /bin/sh symlink missing or broken!" >&2
+        return 1
+    fi
+    
+    # Test busybox sh with proper library path
+    if ! chroot "$temp_dir" /bin/busybox sh -c 'exit 0'; then
+        echo "ERROR: busybox sh test failed!" >&2
+        return 1
+    fi
+    
+    echo "Busybox verification passed"
+    return 0
+}
+
+verify_initramfs_content() {
+    local temp_dir="$1"
+    echo ">>> Verifying initramfs content..."
+    
+    # Check essential directories
+    local required_dirs="bin dev etc lib mnt/root proc sys sbin tmp var/run"
+    local missing_dirs=""
+    
+    for dir in $required_dirs; do
+        if [ ! -d "$temp_dir/$dir" ]; then
+            missing_dirs="$missing_dirs $dir"
+        fi
+    done
+    
+    if [ -n "$missing_dirs" ]; then
+        echo "ERROR: Missing required directories:$missing_dirs" >&2
+        return 1
+    fi
+    
+    # Check essential device nodes
+    if [ ! -c "$temp_dir/dev/console" ] || \
+       [ ! -c "$temp_dir/dev/null" ] || \
+       [ ! -c "$temp_dir/dev/tty" ]; then
+        echo "ERROR: Missing essential device nodes in /dev!" >&2
+        return 1
+    fi
+    
+    # Verify kernel modules
+    if ! find "$temp_dir/lib/modules" -name "*.ko" | grep -q . ; then
+        echo "WARNING: No kernel modules found in initramfs" >&2
+    fi
+    
+    # Check for critical config files
+    if [ ! -f "$temp_dir/etc/init.conf" ]; then
+        echo "WARNING: /etc/init.conf missing" >&2
+    fi
+    
+    # Verify essential binaries in both /bin and /sbin
+    local required_bins="cryptsetup blkid lsmod modprobe insmod"
+    local missing_bins=""
+    
+    for bin in $required_bins; do
+        if [ ! -x "$temp_dir/bin/$bin" ] && [ ! -x "$temp_dir/sbin/$bin" ]; then
+            # Double check if it's a busybox applet
+            if ! "$temp_dir/bin/busybox" --list | grep -q "^$bin$" 2>/dev/null; then
+                missing_bins="$missing_bins $bin"
+            fi
+        fi
+    done
+    
+    if [ -n "$missing_bins" ]; then
+        echo "WARNING: Missing binaries:$missing_bins" >&2
+    fi
+    
+    echo "Basic initramfs content verification passed"
+    return 0
+}
+usage() {
+    (
+        echo "Usage: $(basename "$0") [options]"
+        echo "    -c|--mapper-name  Encrypted root mapper device name"
+        echo "    -H|--hostname     Hostname to be set when initramfs starts"
+        echo "    -h|--help         Show this usage"
+        echo "    -r|--root         Root block device"
+        echo "    -s|--static-root  Directory with static binaries (optional)"
+        echo "    -u|--user         Owner of the final initramfs (optional)"
+    ) | tee /dev/stderr
+    exit 1
+}
+
+lopts="mapper-name: help hostname: root: static-root: user:"
+sopts="c:hH:r:s:u:"
+
+getopt_out="$(getopt -n"$0" --longoptions="$lopts" "$sopts" "$@")"
+[ $? -ne 0 ] && usage >&2
+eval set -- "$getopt_out"
+[ $# -eq 0 ] && usage >&2
+
+opt_mapper_name=
+opt_root=
+opt_help=0
+opt_hostname=
+opt_static_root=
+opt_user="${SUDO_USER:-$(id -un)}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c|--mapper-name)   opt_mapper_name="$2"; shift;;
+        -h|--help)          opt_help=1;;
+        -H|--hostname)      opt_hostname="$2"; shift;;
+        -r|--root)          opt_root="$2"; shift;;
+        -s|--static-root)   opt_static_root="${2%/}"; shift;;
+        -u|--user)          opt_user="$2"; shift;;
+        --)                 shift; break;;
+        -*)                 opt_help=1;;
+        *)                  ;;
+    esac
+    shift
+done
+
+[ $opt_help -ne 0 ] && usage >&2
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: Must run as root." >&2
+    exit 1
+fi
+
+# Detect if root is on an encrypted device (if not specified)
+if [ -z "$opt_mapper_name" ]; then
+    if df -P / | grep -q '^/dev/mapper/'; then
+        opt_mapper_name="$(df -P / | grep '^/dev/mapper/' | \
+            awk '{print $1}' | grep -o '[^/]*$')"
+        [ -z "$opt_mapper_name" ] && opt_mapper_name="root_crypt"
+    fi
+fi
+
+# Determine root device if not specified
+if [ -z "$opt_root" ]; then
+    if df -P / | grep -q '^/dev/mapper/'; then
+        opt_root="$(cryptsetup status "$opt_mapper_name" | awk '/^\s*device:/ {print $2}')"
+    else
+        opt_root="$(df -P / | awk 'NR==2 {print $1}')"
+    fi
+    # If root is an md device, use /dev/md/ path
+    if [ -n "$opt_root" ]; then
+        md_path="$(find -L /dev -maxdepth 2 -samefile "$opt_root" \
+            -path '/dev/md/*' 2>/dev/null | head -n1)"
+        [ -b "$md_path" ] && opt_root="$md_path"
+    fi
+fi
+
+if [ -z "$opt_root" ]; then
+    echo "Error: Unable to determine root device." >&2
+    exit 1
+fi
+
+[ -z "$opt_hostname" ] && opt_hostname="$(hostname -s)"
+
+echo ">>> Initramfs config"
+echo "Hostname:           $opt_hostname"
+echo "Root block device:  $opt_root"
+echo "Mapper device name: $opt_mapper_name"
+echo "Initramfs owner:    $opt_user"
+##################
+# 1. SELECT BINARIES AND MODULES
+##################
+# Essential device nodes
+dev_nodes="console null tty urandom random"
+
+# Minimal /bin
+bin_exe="busybox mount blkid lsblk findfs grep"
+
+# Minimal /sbin
+sbin_exe="cryptsetup blkid lsmod modprobe insmod"
+
+# If root is on md-raid, add mdadm
+if findfs "$opt_root" 2>/dev/null | grep -q '^/dev/md'; then
+    sbin_exe="$sbin_exe mdadm"
+fi
+
+# Kernel version detection and module path resolution
+echo ">>> Kernel module configuration"
+KERNEL_VERSION="$(uname -r)"
+echo "Running kernel version: $KERNEL_VERSION"
+KERNEL_BASE="${KERNEL_VERSION%%-*}"
+echo "Base kernel version: $KERNEL_BASE"
+
+# Determine the correct modules directory
+modules_dir=""
+for dir in /lib/modules/*; do
+    if [ -d "$dir" ] && [ -f "$dir/modules.builtin" ]; then
+        modules_dir="$dir"
+        break
+    fi
+done
+
+if [ -z "$modules_dir" ]; then
+    echo "Error: Could not find a valid modules directory" >&2
+    exit 1
+fi
+
+echo "Found valid modules directory: $modules_dir"
+
+# List of required kernel modules
+echo ">>> Required kernel modules"
+required_modules=(
+    kernel/crypto/crct10dif_common.ko
+    kernel/crypto/crct10dif_generic.ko
+    kernel/lib/crc-t10dif.ko         # CRC T10 DIF support - Dependency for T10
+    kernel/lib/crc64-rocksoft.ko     # CRC64 Rocksoft - Dependency for T10
+    kernel/block/t10-pi.ko           # T10 Protection Information - Dependency for sd_mod.ko
+    kernel/drivers/scsi/sd_mod.ko    # SCSI disk driver
+    kernel/drivers/md/dm-crypt.ko    # Crypto
+    kernel/fs/xfs/xfs.ko
+    kernel/fs/fat/vfat.ko
+    kernel/fs/fat/fat.ko
+    kernel/fs/nls/nls_utf8.ko
+)
+
+# Add RAID modules if needed
+if findfs "$opt_root" 2>/dev/null | grep -q '^/dev/md'; then
+    echo "Adding RAID modules for MD device support"
+    required_modules+=(
+        kernel/drivers/md/md-mod.ko
+        kernel/drivers/md/raid0.ko
+        kernel/drivers/md/raid1.ko
+        kernel/drivers/md/raid10.ko
+        kernel/drivers/md/raid456.ko
+    )
+fi
+
+##################
+# 2. CREATE TEMP BUILD DIRECTORY
+##################
+exit_cleanup() {
+    [ -n "$temp_dir" ] && [ -d "$temp_dir" ] && rm -rf "$temp_dir"
+}
+trap exit_cleanup EXIT
+
+temp_dir="$(mktemp -d --suffix=".build-initramfs")"
+echo ">>> Using temporary directory: $temp_dir"
+
+# Create directory structure
+for dir in bin dev etc lib lib64 mnt/root proc run sys sbin tmp var/log var/run; do
+    mkdir -p "$temp_dir/$dir"
+done
+
+# Create basic configuration
+{
+    echo "HOSTNAME=\"$opt_hostname\""
+    echo "ROOT_DEVICE=\"$opt_root\""
+    echo "MAPPER_NAME=\"$opt_mapper_name\""
+} > "$temp_dir/etc/init.conf"
+##################
+# 3. COPY KERNEL MODULES
+##################
+echo ">>> Copying kernel modules"
+# Create modules directory structure
+mkdir -p "$temp_dir$modules_dir"
+echo "Copying module metadata files..."
+cp "$modules_dir/modules.builtin" "$temp_dir$modules_dir/"
+cp "$modules_dir/modules.order" "$temp_dir$modules_dir/"
+if [ -f "$modules_dir/modules.builtin.modinfo" ]; then
+    cp "$modules_dir/modules.builtin.modinfo" "$temp_dir$modules_dir/"
+fi
+
+# Copy required modules
+echo "Copying required modules:"
+for mod in "${required_modules[@]}"; do
+    echo -n "  $mod: "
+    # Skip if the module is built-in
+    if grep -q "$(basename "$mod" .ko)" /lib/modules/$modules_dir/modules.builtin; then
+        echo "Built-in"
+        continue
+    fi
+    # Copy if the module exists
+    if [ -f "$modules_dir/$mod" ]; then
+        mkdir -p "$temp_dir$modules_dir/$(dirname "$mod")"
+        cp -a "$modules_dir/$mod" "$temp_dir$modules_dir/$mod"
+        echo "OK"
+    else
+        echo "Not found"
+    fi
+done
+
+# Generate modules.dep and map files
+echo "Generating module dependencies..."
+MODULE_DIR_NAME="$(basename "$modules_dir")"
+echo "Running depmod for $MODULE_DIR_NAME"
+depmod -b "$temp_dir" "$MODULE_DIR_NAME"
+
+##################
+# 4. HELPER FUNCTIONS
+##################
+locate_binary() {
+    which_path="$(command -v "$1" 2>/dev/null || true)"
+    if [ -n "$opt_static_root" ] && [ -x "${opt_static_root}${which_path}" ]; then
+        echo "${opt_static_root}${which_path}"
+        return
+    fi
+    echo "$which_path"
+}
+
+calculate_libs() {
+    (
+        for prog in "$@"; do
+            bin_path="$(locate_binary "$prog")"
+            if [ -x "$bin_path" ]; then
+                ldd "$bin_path" 2>/dev/null | grep -oE '\s/[^ ]*' || true
+            fi
+        done
+        # Add NSS libraries
+        find /lib/ -iname 'libnss_files*' 2>/dev/null
+    ) | sort -u
+}
+
+##################
+# 5. COPY LIBRARIES
+##################
+echo ">>> Copying libraries"
+for libpath in $(calculate_libs $bin_exe $sbin_exe); do
+    for realpath in "$libpath" $(readlink -f "$libpath" 2>/dev/null); do
+        [ -z "$realpath" ] && continue
+        bn="$(basename "$realpath")"
+        
+        # Skip if already copied
+        [ -e "$temp_dir/lib/$bn" ] && continue
+        
+        if [ -r "$realpath" ]; then
+            # Copy to /lib
+            cp -af "$realpath" "$temp_dir/lib/$bn"
+            echo "Copied to lib: $realpath"
+            
+            # Also copy to /lib64 if it's a different directory (not a symlink)
+            if [ ! -L "$temp_dir/lib64" ] && [ -d "$temp_dir/lib64" ]; then
+                cp -af "$realpath" "$temp_dir/lib64/$bn"
+                echo "Copied to lib64: $realpath"
+            fi
+        fi
+    done
+done
+
+# Create lib64 symlinks if needed
+if [ ! -L "$temp_dir/lib64" ]; then
+    for lib in "$temp_dir"/lib/*.so*; do
+        bn="$(basename "$lib")"
+        if [ ! -e "$temp_dir/lib64/$bn" ]; then
+            ln -sf "../lib/$bn" "$temp_dir/lib64/$bn"
+        fi
+    done
+fi
+
+# Ensure ld-linux is in the right place with correct permissions
+if [ -f "/lib64/ld-linux-x86-64.so.2" ]; then
+    mkdir -p "$temp_dir/lib64"
+    cp -af "/lib64/ld-linux-x86-64.so.2" "$temp_dir/lib64/"
+    chmod 755 "$temp_dir/lib64/ld-linux-x86-64.so.2"
+fi
+
+# Set up any missing symlinks for libraries
+(
+    cd "$temp_dir/lib" || exit 1
+    for lib in *.so.*; do
+        if [ -f "$lib" ]; then
+            base="${lib%.so.*}.so"
+            if [ ! -e "$base" ]; then
+                ln -sf "$lib" "$base"
+            fi
+        fi
+    done
+)
+
+##################
+# 6. COPY BINARIES
+##################
+echo ">>> Copying binaries"
+# Copy binaries to /bin
+echo "Copying /bin executables:"
+mkdir -p "$temp_dir/bin"
+for b in $bin_exe; do
+    bin_path="$(locate_binary "$b")"
+    if [ -n "$bin_path" ] && [ -x "$bin_path" ]; then
+        cp -af "$bin_path" "$temp_dir/bin"
+        echo "  $b: OK"
+    else
+        echo "  $b: Not found"
+    fi
+done
+
+# Copy binaries to /sbin
+echo "Copying /sbin executables:"
+mkdir -p "$temp_dir/sbin"
+for s in $sbin_exe; do
+    sbin_path="$(locate_binary "$s")"
+    if [ -n "$sbin_path" ] && [ -x "$sbin_path" ]; then
+        cp -af "$sbin_path" "$temp_dir/sbin"
+        echo "  $s: OK"
+    else
+        echo "  $s: Not found"
+    fi
+done
+(
+    cd "$temp_dir/bin"
+    ln -sf busybox sh
+    ./busybox --install -s .
+)
+##################
+# 7. CREATE BASE DEVICE NODES
+##################
+echo ">>> Creating device nodes"
+# Create essential device nodes with proper permissions
+echo "Creating basic device nodes:"
+mknod -m 600 "$temp_dir/dev/console" c 5 1
+mknod -m 666 "$temp_dir/dev/null" c 1 3
+mknod -m 666 "$temp_dir/dev/zero" c 1 5
+mknod -m 666 "$temp_dir/dev/random" c 1 8
+mknod -m 666 "$temp_dir/dev/urandom" c 1 9
+mknod -m 666 "$temp_dir/dev/tty" c 5 0
+mkdir -p "$temp_dir/dev/mapper"
+mknod -m 600 "$temp_dir/dev/mapper/control" c 10 236
+
+##################
+# 8. COPY INIT SCRIPT
+##################
+echo ">>> Copying init script"
+if [ ! -f files/init ]; then
+    echo "Error: 'files/init' not found!" >&2
+    exit 1
+fi
+
+# Verbose copy and permission check of init script
+echo "Source init script details:"
+ls -l files/init
+file files/init
+echo "First line of init script:"
+head -n1 files/init
+
+echo "Copying init script..."
+cp -v files/init "$temp_dir/init"
+chmod +x "$temp_dir/init"
+
+# Verify copy and permissions
+if [ ! -f "$temp_dir/init" ]; then
+    echo "ERROR: init script missing after copy!" >&2
+    exit 1
+fi
+
+if [ ! -x "$temp_dir/init" ]; then
+    echo "ERROR: init script not executable!" >&2
+    exit 1
+fi
+
+echo "Copied init script details:"
+ls -l "$temp_dir/init"
+file "$temp_dir/init"
+echo "Verifying first line of copied init script:"
+head -n1 "$temp_dir/init"
+##################
+# 9. VERIFY INITRAMFS
+##################
+echo ">>> Running verification steps"
+
+verify_busybox "$temp_dir" || exit 1
+verify_init "$temp_dir" || exit 1
+verify_initramfs_content "$temp_dir" || exit 1
+
+echo ">>> Generating initramfs content list for verification"
+(
+    cd "$temp_dir"
+    find . -type f -o -type l -o -type b -o -type c | sort > ../initramfs_content.txt
+)
+echo "Content list saved to: $(pwd)/initramfs_content.txt"
+
+##################
+# 10. CREATE INITRAMFS
+##################
+output_file="$(readlink -f ./initramfs.cpio.gz)"
+echo ">>> Creating initramfs archive"
+echo "Verifying init script before archive creation:"
+ls -l "$temp_dir/init" || { echo "ERROR: Init missing before archive creation!"; exit 1; }
+
+(
+    cd "$temp_dir"
+    # List all files being added to archive
+    echo "Files to be included in initramfs:"
+    find . -ls
+
+    echo "Creating archive..."
+    find . -print0 | cpio --null -o -H newc -v 2>../cpio.log | gzip -9 > "$output_file"
+)
+
+echo ">>> Verifying init in final archive"
+zcat "$output_file" | cpio -t 2>/dev/null | grep -E '^init$'
+if [ $? -ne 0 ]; then
+    echo "ERROR: init script not found in final archive!" >&2
+    exit 1
+fi
+
+# Set ownership if requested
+if [ -n "$opt_user" ] && id -u "$opt_user" >/dev/null 2>&1; then
+    chown "$opt_user:$opt_user" "$output_file"
+fi
+
+echo ">>> Built initramfs: $output_file"
+echo ">>> Final verification - testing archive integrity"
+gzip -t "$output_file" || { echo "ERROR: Archive verification failed!"; exit 1; }
+
+echo ">>> Showing files in the initramfs:"
+zcat "$output_file" | cpio -t | grep -E '^(init|bin/|sbin/|lib/)'
+
+echo ">>> Finished successfully"

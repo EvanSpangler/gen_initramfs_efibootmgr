@@ -1,0 +1,47 @@
+#!/bin/sh
+# Kernel postinstall script for EFI boot entry creation 
+# Lives in /usr/lib/kernel/postinst.d, not /etc/kernel
+# Verbose mode for debugging
+set -x
+
+# Find the latest kernel (excluding .old files)
+KERNEL=$(ls /efi/vmlinuz-*[!.old] | sort -V | tail -n1)
+
+# Original initramfs lookup logic (commented out)
+# INITRAMFS=$(ls /efi/initramfs-*[!.old] | sort -V | tail -n1)
+
+# Use custom initramfs from EFI/BOOT
+INITRAMFS="/efi/EFI/BOOT/initramfs.cpio.gz"
+
+# Source initramfs location
+SOURCE_INITRAMFS="/root/initramfs/initramfs.cpio.gz"
+
+# Verify files exist
+if [ ! -f "$KERNEL" ] || [ ! -f "$SOURCE_INITRAMFS" ]; then
+   echo "Kernel or source initramfs file not found!"
+   exit 1
+fi
+
+# Extract just the filename, not the full path
+KERNEL_FILENAME=$(basename "$KERNEL")
+INITRAMFS_FILENAME=$(basename "$INITRAMFS")
+
+# Remove existing Gentoo boot entries
+for entry in $(efibootmgr | grep -i "Gentoo" | cut -c5-8 || true); do
+   efibootmgr -b "$entry" -B 2>/dev/null || true
+done
+
+# Ensure the EFI directory exists
+mkdir -p /efi/EFI/BOOT
+
+# Copy kernel and initramfs to EFI directory
+cp "$KERNEL" "/efi/EFI/BOOT/BOOTX64.efi"
+cp "$SOURCE_INITRAMFS" "$INITRAMFS"
+
+# Create new EFI boot entry
+efibootmgr -c \
+   -d /dev/sda \
+   -p 1 \
+   -L "Gentoo Linux" \
+   -l "\\EFI\\BOOT\\BOOTX64.efi" \
+   -u " root=/dev/mapper/cryptroot initrd=\\EFI\\BOOT\\initramfs.cpio.gz rd.luks.header=/dev/sda4 rd.luks.data=/dev/sda3 rd.luks.name=cryptroot=root rd.luks.options=luks2 rd.luks.key=yes iommu=pt,force_on intel_iommu=on,igfx_off pcie_acs_override=downstream,multifunction vfio_iommu_type1.allow_unsafe_interrupts=1 pci=realloc"

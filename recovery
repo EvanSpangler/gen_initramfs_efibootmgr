@@ -1,0 +1,21 @@
+#!/bin/bash
+# A simple script to chroot from liveUSB with proper EFI support
+# open disk
+cryptsetup luksOpen --header /dev/sda4 /dev/sda3 cryptroot
+
+# Mount root partition
+mount /dev/mapper/cryptroot /mnt
+
+# Mount EFI partition
+mount /dev/sda1 /mnt/efi
+
+# Mount system directories
+mount -t proc none /mnt/proc
+mount --rbind /sys /mnt/sys
+mount --rbind /dev /mnt/dev
+mount --make-rslave /mnt/sys
+mount --make-rslave /mnt/dev
+mount -t efivarfs efivarfs /mnt/sys/firmware/efi/efivars
+
+arch-chroot /mnt /bin/bash 
+exit

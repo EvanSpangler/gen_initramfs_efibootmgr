@@ -1,0 +1,33 @@
+mkdir test
+cd test
+zcat ../initramfs.cpio.gz | cpio -idm
+mkdir -p proc sys dev
+mount -t proc proc proc/
+mount -t sysfs sys sys/
+mount -t devtmpfs none dev/
+
+# Chroot with busybox shell
+chroot . /bin/busybox sh <<EOF
+
+# Test each modprobe command in sequence
+MODULE_DIR=$(ls -d /lib/modules/* | head -n1)
+modprobe -d $MODULE_DIR libata
+sleep 1
+modprobe -d $MODULE_DIR ahci
+modprobe -d $MODULE_DIR sd_mod
+modprobe -d $MODULE_DIR dm-mod
+modprobe -d $MODULE_DIR dm-crypt
+
+# Check what got loaded
+lsmod
+
+# Check if devices appear
+ls -l /dev/sd*
+EOF
+
+chroot . /bin/busybox sh 
+
+cd test
+umount proc sys dev
+cd ..
+rm -rf test
